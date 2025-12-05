@@ -1,0 +1,1804 @@
+<html>
+<pre>
+<code>
+; Tambahkan fitur kirim data saat terjadi perubahan status pada OBS dan Loop Coil
+; Handle restart saat terima data 2 byte atau lebih dalam waktu yang bersamaan.
+; - - -WDT  CS2 CS1 A1 A0  D7 - - -  - - - DO
+; _______1__ 8 __4__2__1____8_4_2_1__8_4_2_1_  ________
+
+;WDT1       	EQU 1800H
+;WDT0       	EQU 0800H
+;OUTPUTA    	EQU 800H        		66 - 81     42H  - 51H
+;OUTPUTB    	EQU 900H        		28 - 95     52H  - 61H
+;OUTPUTC    	EQU 0A00H       		96 - 113    62H  - 71H
+;INPUTA     	EQU 400H                82H  - 91H
+;INPUTB     	EQU 500H                92H  - 0A1H
+;INPUTC     	EQU 600H                0A2H - 0B1H
+
+DLY_10US    	EQU 31H
+DATA_8255   	EQU 32H
+STATUS_RX   	EQU 33H
+STATUS_DET  	EQU 34H
+TIMER_LC    	EQU 35H
+TIMER_OBS   	EQU 36H
+TIMER_LED   	EQU 37H
+TIMER_BUZZER    EQU 38H
+LC_15DETIK  	EQU 39H
+OBS_15DETIK 	EQU 40H
+OUTTEMP_A   	EQU 51H 		
+OUTTEMP_B   	EQU 52H
+OUTTEMP_C   	EQU 53H
+OBS_POLL    	EQU 44H         		;BYAP
+LC_POLL     	EQU 45H         		;BYAP
+TX_BUFFER   	EQU 47H         		; Buffer untuk 1 byte transmisi yang tertunda
+
+LC_FLAG     	EQU 20H.0 
+OBS_FLAG    	EQU 20H.1
+LED_FLAG    	EQU 20H.2
+BUZZER_FLAG 	EQU 20H.3
+SER_FLAG    	EQU 20H.4
+LCLNG_FLAG  	EQU 20H.5
+OBSLNG_FLAG 	EQU 20H.6
+LLA_FLAG    	EQU 20H.7
+LCKIR_FLAG  	EQU 21H.0
+OBSKIR_FLAG 	EQU 21H.1
+LLAKIR_FLAG 	EQU 21H.2
+TXFLAG      	EQU 21H.3
+LC          	EQU 21H.4
+OBS         	EQU 21H.5
+SWLTS_FLAG  	EQU 21H.6
+TX_PENDING_FLAG EQU 22H.0       		; Flag: 1 jika ada byte di TX_BUFFER
+
+;OBS        	EQU P3.2            	;BYAP
+;LC     		EQU P1.5            		;BYAP
+OBS_PIN     	EQU P3.2            	;BYAP
+LC_PIN      	EQU P1.5            	;BYAP
+LLA         	EQU P1.6
+LTSPNT      	EQU P1.7
+LED         	EQU P3.4
+DTR         	EQU P1.1
+RTS         	EQU P1.3
+FDP         	EQU P3.5
+CTS         	EQU P1.2
+DSR         	EQU P1.0
+CONST_25MSL 	EQU 0
+CONST_25MSH 	EQU 0A6H
+MASK_PIN    	EQU 01fh
+
+;***************************************************************
+;           ORG PROG
+;***************************************************************
+    ORG 0000H
+    JMP MAIN
+    ORG 0003H
+    RETI
+    ORG 000BH
+    JMP INT_TIMER
+    ORG 0013H
+    RETI
+    ORG 001BH
+    RETI
+    ORG 0023H
+    JMP INT_SER
+
+;***************************************************************
+;           DELAY
+;***************************************************************
+DELAY_10US:
+    NOP
+    NOP
+    NOP
+    NOP
+    NOP
+    NOP
+    NOP
+    NOP
+    NOP
+    NOP
+	;DJNZ	DLY_10US,DELAY_10US
+    RET
+    
+DELAY_2MS:  
+    MOV 	DLY_10US,#0FFH
+    ACALL   DELAY_10US
+    RET
+
+
+;***************************************************************
+;            SUB INTERRUPT TIMER 0 PROG
+;                (25mS)
+;***************************************************************
+SUB_INT_LC:
+    MOV 	A,#16H
+    CALL    KIRIM
+    CLR 	LCKIR_FLAG
+    RET
+        
+SUB_INT_OBS:
+    MOV 	A,#14H
+    CALL    KIRIM
+    CLR 	OBSKIR_FLAG
+    RET
+
+SUB_INT_LED:
+    SETB    LED
+    SETB    LED_FLAG
+    RET
+    
+SUB_INT_BUZZER:
+    CALL    ALMTOUTB
+    CLR 	ACC.4
+    MOVX    @DPTR,A
+    MOV 	OUTTEMP_B,A
+    SETB    BUZZER_FLAG
+    RET 
+    
+;***************************************************************
+;            INTERRUPT TIMER 0 PROG
+;                (25mS)
+;***************************************************************
+INT_TIMER: 
+    PUSH    ACC
+    PUSH    PSW
+    PUSH    DPL
+    PUSH    DPH
+    MOV     TL0,#CONST_25MSL    		;TIMER  L
+    MOV     TH0,#CONST_25MSH    		;TIMER  H
+
+CEK_LC_PIN: 
+    MOV 	A,LC_POLL
+    MOV 	C,LC_PIN
+    RLC 	A
+    ANL 	A,#MASK_PIN
+    MOV 	LC_POLL,A
+    CJNE    A,#00H,CEK_LC_PIN1
+    CLR 	LC
+    JMP 	CEK_OBS_PIN 
+CEK_LC_PIN1:
+    CJNE    A,#MASK_PIN,CEK_OBS_PIN
+    SETB    LC
+    
+CEK_OBS_PIN:
+    MOV 	A,OBS_POLL
+    MOV 	C,OBS_PIN
+    RLC 	A
+    ANL 	A,#MASK_PIN
+    MOV 	OBS_POLL,A
+    CJNE    A,#00H,CEK_OBS_PIN1
+    CLR 	OBS
+    JMP 	CEK_PIN_END
+	
+CEK_OBS_PIN1:
+    CJNE    A,#MASK_PIN,CEK_PIN_END
+    SETB    OBS
+	
+CEK_PIN_END:    
+    JB  	LC_FLAG,INT_TIMER2  		;CHECK LC FLAG
+    MOV 	A,LC_15DETIK
+    CJNE    A,#00,INT_TIMER1
+    CLR 	LCLNG_FLAG
+    JNB 	LCKIR_FLAG,INT_TIMER2
+    CALL    SUB_INT_LC
+    SJMP    INT_TIMER2  
+    
+INT_TIMER1:
+    DEC 	TIMER_LC        			;TIMER LC - 1
+    MOV 	A,TIMER_LC
+    CJNE    A,#00,INT_TIMER2
+    DEC 	LC_15DETIK
+    MOV 	TIMER_LC,#180
+    
+INT_TIMER2:
+    JB  	OBS_FLAG,INT_TIMER3 		;CHECK OBS FLAG
+    MOV 	A,OBS_15DETIK
+    CJNE    A,#00,INT_TIMER2A
+    CLR 	OBSLNG_FLAG
+    JNB 	OBSKIR_FLAG,INT_TIMER3
+    CALL    SUB_INT_OBS
+    SJMP    INT_TIMER3
+    
+INT_TIMER2A:
+    DEC 	TIMER_OBS       			;TIMER OBS - 1
+    MOV 	A,TIMER_OBS
+    CJNE    A,#00,INT_TIMER3
+    DEC 	OBS_15DETIK
+    MOV 	TIMER_OBS,#180
+    
+INT_TIMER3:             
+    JB  	LED_FLAG,INT_TIMER4 		;CHECK LED FLAG
+    MOV 	A,TIMER_LED
+    CJNE    A,#00,INT_TIMER3A
+    CALL    SUB_INT_LED
+    SJMP    INT_TIMER4
+    
+INT_TIMER3A:
+    DEC 	TIMER_LED       			;TIMER LED - 1
+
+INT_TIMER4:
+    JB  	BUZZER_FLAG,INT_TIMER5  	;CHECK BUZZER FLAG
+    MOV 	A,TIMER_BUZZER
+    CJNE    A,#00,INT_TIMER4A
+    CALL    SUB_INT_BUZZER
+    SJMP    INT_TIMER5
+    
+INT_TIMER4A:
+    DEC 	TIMER_BUZZER        		;TIMER BUZZER - 1
+    
+INT_TIMER5:
+    POP     DPH
+    POP     DPL
+    POP 	PSW
+    POP 	ACC
+    RETI    
+
+;***************************************************************
+;           WATCH DOG PROG
+;***************************************************************
+WDT:
+    MOV 	DPTR,#1800H     			;WDT "1"
+    MOVX    A,@DPTR
+    ;MOVX   @DPTR,A
+    MOV 	DPTR,#800H      			;WDT "0"
+    MOVX    A,@DPTR
+    ;MOVX   @DPTR,OUTTEMP_A
+    RET
+
+;***************************************************************
+;           LC PROG
+;***************************************************************    
+LC_DET:
+    JNB 	LC_FLAG,LC_DET1     		;CHECK  LC LC FLAG 1
+    JNB 	LC,LC_DET1      			;CHECK  LC 1
+    CALL    DELAY_10US
+	
+	MOV 	A,#0B5H          			;UPDATE IOT
+    CALL    KIRIM
+	
+    CLR 	LC_FLAG
+    MOV 	TIMER_LC,#180       		;MULAI CHECK LAMA LC DETEKSI
+    MOV 	LC_15DETIK,#3
+    INC 	STATUS_DET
+    MOV 	A,STATUS_DET
+    CJNE    A,#31H,LC_DET0A
+    SJMP    LC_DET1
+	
+LC_DET0A:
+    CJNE    A,#32H,LC_DET01
+    MOV 	A,#11H          			;KIRIM 'DETEKSI'
+    CALL    KIRIM
+    ;CLR 	LED_FLAG
+    ;CLR 	LED
+    ;MOV 	TIMER_LED,#4
+    SJMP    LC_DET1
+	
+LC_DET01:
+    CJNE    A,#33H,LC_DET02
+    MOV 	A,#17H          			;KIRIM 'GANDENGAN'
+    CALL    KIRIM
+    SJMP    LC_DET1
+	
+LC_DET02:
+    MOV 	A,#12H          			;KIRIM 'OBS ALARM'
+    CALL    KIRIM
+    MOV 	STATUS_DET,#33H
+	
+LC_DET1:
+    JB  	LC_FLAG,LC_DET2     		;CHECK LC FLAG 0
+    JB  	LC,LC_DET2      			;CHECK LC 0
+    CALL    DELAY_10US
+    MOV 	A,STATUS_DET
+    CJNE    A,#31H,LC_DET11
+    JB  	LCLNG_FLAG,LC_DET1A 		;CHECK LONG DETEKSI
+    MOV 	STATUS_DET,#30H
+    CALL    READY_LC
+    RET
+	
+LC_DET1A:
+    MOV 	A,#15H          			;KIRIM 'LC DETEKSI'
+    CALL    KIRIM
+    MOV 	STATUS_DET,#30H
+    SETB    LC_FLAG
+	MOV 	A,#0B4H          			;UPDATE IOT
+    CALL    KIRIM
+    RET
+	
+LC_DET11:
+    JB  	OBS,LC_DET12        		;READY DNG OBS 0
+    JB  	LCLNG_FLAG,LC_DET11A    	;CHECK LONG DETEKSI
+    MOV 	STATUS_DET,#30H
+    CALL    READY_LC
+    RET
+	
+LC_DET11A:
+    MOV 	STATUS_DET,#30H
+    SETB    LC_FLAG
+	MOV 	A,#0B4H          			;UPDATE IOT
+    CALL    KIRIM
+    RET
+	
+LC_DET12:
+    MOV 	A,STATUS_DET
+    CJNE    A,#33H,LC_DET13     		;READY DARI GANDENGAN
+    JB  	LCLNG_FLAG,LC_DET12A    	;CHECK LONG DETEKSI
+    CALL    READY_LC
+    RET
+	
+LC_DET12A:
+    SETB    LC_FLAG
+	MOV 	A,#0B4H          			;UPDATE IOT
+    CALL    KIRIM
+    RET
+	
+LC_DET13:
+    MOV 	STATUS_DET,#32H
+    JB  	LCLNG_FLAG,LC_DET12A
+    CALL    READY_LC        			;READY DARI OBS ALARM
+	
+LC_DET2:    
+    RET
+	
+READY_LC:               				;READY_LC
+    MOV 	A,#19H          			;KIRIM READY DARI LC LONG DETEKSI
+    CALL    KIRIM
+    SETB    LC_FLAG
+	MOV 	A,#0B4H          			;UPDATE IOT
+    CALL    KIRIM
+    SETB    LCLNG_FLAG
+    SETB    LCKIR_FLAG
+    RET
+;***************************************************************
+;           OBS PROG
+;***************************************************************
+OBS_DET:
+    JNB 	OBS_FLAG,OBS_DET1   		;CHECK OBS FLAG 1
+    JNB 	OBS,OBS_DET1        		;CHECK OBS 1
+    CALL    DELAY_10US
+	
+	MOV 	A,#0B3H          			;UPDATE IOT
+    CALL    KIRIM
+	
+    CLR 	OBS_FLAG        			;FLAG 0
+    MOV 	TIMER_OBS,#180      		;MULAI CHECK LAMA OBS DETEKSI
+    MOV 	OBS_15DETIK,#3
+    INC 	STATUS_DET
+    MOV 	A,STATUS_DET
+    CJNE    A,#31H,OBS_DET0
+    SJMP    OBS_DET1
+	
+OBS_DET0:   
+    MOV 	A,#11H          			;KIRIM 'DETEKSI'
+    CALL    KIRIM
+    ;CLR 	LED_FLAG
+    ;CLR 	LED
+    ;MOV 	TIMER_LED,#8
+	
+OBS_DET1:
+    JB  	OBS_FLAG,OBS_DET2   		;CHECK OBS FLAG 0
+    JB  	OBS,OBS_DET2        		;CHECK OBS 0
+    CALL    DELAY_10US
+    MOV 	A,STATUS_DET
+    CJNE    A,#31H,OBS_DET11
+    JB  	OBSLNG_FLAG,OBS_DET1A   	;CHECK OBS LONG DETEKSI FLAG
+    MOV 	STATUS_DET,#30H
+    CALL    READY_OBS
+    RET
+	
+OBS_DET1A:
+    MOV 	A,#13H          			;KIRIM 'OBS DETEKSI'
+    CALL    KIRIM
+    MOV 	STATUS_DET,#30H
+    SETB    OBS_FLAG
+	MOV 	A,#0B2H          			;UPDATE IOT
+    CALL    KIRIM
+    RET
+	
+OBS_DET11:
+    JB  	LC,OBS_DET12
+    MOV 	STATUS_DET,#30H
+    JB  	OBSLNG_FLAG,OBS_DET12A
+    CALL    READY_OBS
+    RET
+	
+OBS_DET12:
+    MOV 	A,STATUS_DET
+    CJNE    A,#39H,OBS_DET13
+    MOV 	STATUS_DET,#32H
+    JB  	OBSLNG_FLAG,OBS_DET12A  	;CHECK OBS LONG DETEKSI FLAG
+    CALL    READY_OBS
+    RET
+	
+OBS_DET12A:
+    SETB    OBS_FLAG
+	MOV 	A,#0B2H          			;UPDATE IOT
+    CALL    KIRIM
+    RET
+	
+OBS_DET13:
+    JB  	OBSLNG_FLAG,OBS_DET12A  	;CHECK OBS LONG DETEKSI FLAG
+    CALL    READY_OBS
+    RET
+	
+OBS_DET2:
+    RET 
+    
+READY_OBS:              				;READY_OBS      
+    MOV 	A,#18H
+    CALL    KIRIM
+    SETB    OBS_FLAG
+	MOV 	A,#0B2H          			;UPDATE IOT
+    CALL    KIRIM
+    SETB    OBSLNG_FLAG
+    SETB    OBSKIR_FLAG
+    RET
+
+TABLEOUT:   JMP     OUTA0       		;52H (data output to port PIO 8255, ver asli 42h ditambahkan 10h)
+            JMP     OUTA01
+            JMP     OUTA1       		;54H
+            JMP     OUTA11
+            JMP     OUTA2       		;56H
+            JMP     OUTA21
+            JMP     OUTA3       		;58H
+            JMP     OUTA31 
+            JMP     OUTA4       		;5AH
+            JMP     OUTA41
+            JMP     OUTA5       		;5CH
+            JMP     OUTA51
+            JMP     OUTA6       		;5EH
+            JMP     OUTA61
+            JMP     OUTA7       		;60H
+            JMP     OUTA71
+            JMP     OUTB0       		;62H
+            JMP     OUTB01
+            JMP     OUTB1       		;64H
+            JMP     OUTB11
+            JMP     OUTB2       		;66H
+            JMP     OUTB21
+            JMP     OUTB3       		;68H
+            JMP     OUTB31
+            JMP     OUTB4       		;7AH
+            JMP     OUTB41
+            JMP     OUTB5      			;7CH
+            JMP     OUTB51
+            JMP     OUTB6       		;7EH
+            JMP     OUTB61
+            JMP     OUTB7       		;80H
+            JMP     OUTB71
+            JMP     OUTC0       		;82H
+            JMP     OUTC01
+            JMP     OUTC1       		;84H
+            JMP     OUTC11
+            JMP     OUTC2       		;86H
+            JMP     OUTC21
+            JMP     OUTC3       		;88H
+            JMP     OUTC31
+            JMP     OUTC4       		;9AH
+            JMP     OUTC41
+            JMP     OUTC5       		;9CH
+            JMP     OUTC51
+            JMP     OUTC6       		;9EH
+            JMP     OUTC61
+            JMP     OUTC7       		;AFH
+            JMP     OUTC71
+            JMP     TABLE1      		;BFH
+            JMP     TABLE1
+            JMP     TABLE1      		;DFH
+            JMP     TABLE1
+            JMP     TABLE1      		;FFH
+            JMP     TABLE1
+            JMP     TABLE1      		;11FH
+            JMP     TABLE1
+            JMP     TABLE1      		;7AH
+            JMP     TABLE1
+            JMP     TABLE1      		;7CH
+            JMP     TABLE1
+            JMP     TABLE1      		;7EH
+            JMP     TABLE1
+            JMP     TABLE1      		;80H
+            JMP     TABLE1
+
+            
+TABLEIN:    JMP     INA0        		;82H
+            JMP     TABLE1
+            JMP     INA1
+            JMP     TABLE1
+            JMP     INA2
+            JMP     TABLE1
+            JMP     INA3
+            JMP     TABLE1
+            JMP     INA4
+            JMP     TABLE1
+            JMP     INA5
+            JMP     TABLE1
+            JMP     INA6
+            JMP     TABLE1
+            JMP     INA7
+            JMP     TABLE1
+            JMP     INB0        		;92H
+            JMP     TABLE1
+            JMP     INB1
+            JMP     TABLE1
+            JMP     INB2
+            JMP     TABLE1
+            JMP     INB3
+            JMP     TABLE1
+            JMP     INB4
+            JMP     TABLE1
+            JMP     INB5
+            JMP     TABLE1
+            JMP     INB6
+            JMP     TABLE1
+            JMP     INB7
+            JMP     TABLE1
+            JMP     INC0        		;A2H
+            JMP     TABLE1
+            JMP     INC1
+            JMP     TABLE1
+            JMP     INC2
+            JMP     TABLE1
+            JMP     INC3
+            JMP     TABLE1
+            JMP     INC4
+            JMP     TABLE1
+            JMP     INC5
+            JMP     TABLE1
+            JMP     INC6
+            JMP     TABLE1
+            JMP     INC7
+            JMP     TABLE1
+            JMP     DET_0       		;B2H
+            JMP     TABLE1
+            JMP     DET_1
+            JMP     TABLE1
+            JMP     DET_2
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+
+TABLECO:    JMP     COA0        		;C2H
+            JMP     TABLE1
+            JMP     COA1
+            JMP     TABLE1
+            JMP     COA2
+            JMP     TABLE1
+            JMP     COA3
+            JMP     TABLE1
+            JMP     COA4
+            JMP     TABLE1
+            JMP     COA5
+            JMP     TABLE1
+            JMP     COA6
+            JMP     TABLE1
+            JMP     COA7
+            JMP     TABLE1
+            JMP     COB0        		;D2H
+            JMP     TABLE1
+            JMP     COB1
+            JMP     TABLE1
+            JMP     COB2
+            JMP     TABLE1
+            JMP     COB3
+            JMP     TABLE1
+            JMP     COB4
+            JMP     TABLE1
+            JMP     COB5
+            JMP     TABLE1
+            JMP     COB6
+            JMP     TABLE1
+            JMP     COB7
+            JMP     TABLE1
+            JMP     COC0        		;E2H
+            JMP     TABLE1
+            JMP     COC1
+            JMP     TABLE1
+            JMP     COC2
+            JMP     TABLE1
+            JMP     COC3
+            JMP     TABLE1
+            JMP     COC4
+            JMP     TABLE1
+            JMP     COC5
+            JMP     TABLE1
+            JMP     COC6
+            JMP     TABLE1
+            JMP     COC7
+            JMP     TABLE1
+            JMP     TABLE1    			;F2H
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            JMP     TABLE1
+            
+TABLE1:     RET
+
+;***************************************************************
+;           FDP COMPARE PROG
+;***************************************************************
+INT_SER:
+    PUSH    ACC
+    PUSH    PSW
+    PUSH    DPH
+    PUSH    DPL
+
+FDP_CMPR:
+    JNB 	RI,FDP_CMPR3
+    CLR 	RI
+    MOV 	A,SBUF
+    CJNE    A,#02H,FDP_CMPR1
+    CLR 	SER_FLAG
+    SJMP    SER_END
+	
+FDP_CMPR1:
+    CJNE    A,#03H,FDP_CMPR2
+    SETB    SER_FLAG
+    SJMP    SER_END
+	
+FDP_CMPR2:
+    CALL    CHECK_SER
+    SJMP 	SER_END
+	
+FDP_CMPR3:
+	JNB 	TI , SER_END 
+    CLR		TI
+    JNB     TX_PENDING_FLAG, FDP_CMPR4		; Cek apakah ada transmisi yang tertunda di buffer
+    CLR     TX_PENDING_FLAG					; Jika ada, kirim sekarang
+    MOV     SBUF, TX_BUFFER
+    JMP     SER_END							; TXFLAG tetap 0 (sibuk) karena kita baru saja memulai transmisi baru
+	
+FDP_CMPR4:	
+    SETB	TXFLAG
+	
+SER_END:
+    POP 	DPL
+    POP 	DPH
+    POP 	PSW
+    POP 	ACC
+    RETI
+	
+;***************************************************************
+;           CHECK SERIAL PROG
+;***************************************************************
+CHECK_SER:
+    JNB SER_FLAG,CHECK_SEREND
+    MOV STATUS_RX,A
+
+        MOV     A,STATUS_RX
+        CLR     C
+        SUBB    A,#72H
+        JNC     CHECK_SER1
+        MOV     A,STATUS_RX
+        CLR     C
+        SUBB    A,#52H    
+        MOV     B,#3
+        MUL     AB
+        MOV     DPTR,#TABLEOUT
+        JMP     @A+DPTR
+        RET
+CHECK_SER1:
+        MOV     A,STATUS_RX
+        CLR     C
+        SUBB    A,#0c1H
+        JNC     CHECK_SER2
+        MOV     A,STATUS_RX
+        CLR     C
+        SUBB    A,#82H
+        MOV     B,#3
+        MUL     AB
+        MOV     DPTR,#TABLEIN
+        JMP     @A+DPTR
+        RET
+CHECK_SER2:
+        MOV     A,STATUS_RX
+        CLR     C
+        SUBB    A,#0F2H
+        JNC     CHECK_SEREND
+        MOV     A,STATUS_RX
+        CLR     C
+        SUBB    A,#0c2H
+        MOV     B,#3
+        MUL     AB
+        MOV     DPTR,#TABLECO
+        JMP     @A+DPTR
+        RET
+CHECK_SEREND:
+    RET     
+    
+;***************************************************************
+;           KIRIM PROG + LED 
+;***************************************************************
+KIRIM:
+    CJNE    A,#11H,NOT_LED_CMD				; --- CEK PERINTAH 0x11 DULU ---	
+    CLR     LED								; Jika 0x11 ? reset LED
+    CLR     LED_FLAG
+    MOV     TIMER_LED,#10					; 10 x 25ms
+
+NOT_LED_CMD:
+    JNB     TXFLAG, KIRIM_BUSY				; --- CEK STATUS TX ---
+    CLR     TXFLAG							; Jika TX bebas, langsung kirim
+    MOV     SBUF, A
+    RET
+
+KIRIM_BUSY:						
+    JB      TX_PENDING_FLAG, KIRIM_ABORT   	; Jika sibuk, simpan byte di buffer untuk dikirim nanti oleh TI
+    MOV     TX_BUFFER, A					; Jika buffer sudah penuh, abaikan
+    SETB    TX_PENDING_FLAG
+
+KIRIM_ABORT:
+    RET
+    
+ALAMATA:
+    MOV 	DPTR,#400H      
+    MOVX    A,@DPTR
+    RET
+ALAMATB:
+    MOV 	DPTR,#500H      
+    MOVX    A,@DPTR
+    RET
+ALAMATC:
+    MOV 	DPTR,#600H      
+    MOVX    A,@DPTR
+    RET
+    
+
+;***************************************************************
+;           BACA INPUT A PROG
+;***************************************************************
+INA0:
+    CALL    ALAMATA
+    JB  	ACC.0,INA01
+    MOV 	A,#82H
+    CALL    KIRIM
+    RET
+	
+INA01:
+    MOV     A,#83H
+    CALL    KIRIM
+    RET
+	
+INA1:
+    CALL    ALAMATA
+    JB  	ACC.1,INA11
+    MOV 	A,#84H
+    CALL    KIRIM
+    RET
+	
+INA11:
+    MOV 	A,#85H
+    CALL    KIRIM
+    RET
+	
+INA2:
+    CALL    ALAMATA
+    JB  	ACC.2,INA21
+    MOV 	A,#86H
+    CALL    KIRIM
+    RET
+	
+INA21:
+    MOV 	A,#87H
+    CALL    KIRIM
+    RET
+	
+INA3:
+    CALL    ALAMATA
+    JB  	ACC.3,INA31
+    MOV 	A,#88H
+    CALL    KIRIM
+    RET
+	
+INA31:
+    MOV A,#89H
+    CALL    KIRIM
+    RET
+	
+INA4:
+    CALL    ALAMATA
+    JB  ACC.4,INA41
+    MOV A,#8AH
+    CALL    KIRIM
+    RET
+	
+INA41:
+    MOV A,#8BH
+    CALL    KIRIM
+    RET
+	
+INA5:
+    CALL    ALAMATA
+    JB  ACC.5,INA51
+    MOV A,#8CH
+    CALL    KIRIM
+    RET
+	
+INA51:
+    MOV A,#8DH
+    CALL    KIRIM
+    RET
+	
+INA6:
+    CALL    ALAMATA
+    JB  ACC.6,INA61
+    MOV A,#8EH
+    CALL    KIRIM
+    RET
+	
+INA61:
+    MOV A,#8FH
+    CALL    KIRIM
+    RET
+	
+INA7:
+    CALL    ALAMATA
+    JB  ACC.7,INA71
+    MOV A,#90H
+    CALL    KIRIM
+    RET
+	
+INA71:
+    MOV A,#91H
+    CALL    KIRIM
+INA8:
+    RET
+;***************************************************************
+;           BACA INPUT B PROG
+;***************************************************************
+INB0:
+    CALL    ALAMATB
+    JB  ACC.0,INB01
+    MOV A,#92H
+    CALL    KIRIM
+    RET
+INB01:
+    MOV A,#93H
+    CALL    KIRIM
+    RET
+INB1:
+    CALL    ALAMATB
+    JB  ACC.1,INB11
+    MOV A,#94H
+    CALL    KIRIM
+    RET
+INB11:
+    MOV A,#95H
+    CALL    KIRIM
+    RET
+INB2:
+    CALL    ALAMATB
+    JB  ACC.2,INB21
+    MOV A,#96H
+    CALL    KIRIM
+    RET
+INB21:
+    MOV A,#97H
+    CALL    KIRIM
+    RET
+INB3:
+    CALL    ALAMATB
+    JB  ACC.3,INB31
+    MOV A,#98H
+    CALL    KIRIM
+    RET
+INB31:
+    MOV A,#99H
+    CALL    KIRIM
+    RET
+INB4:
+    CALL    ALAMATB
+    JB  ACC.4,INB41
+    MOV A,#9AH
+    CALL    KIRIM
+    RET
+INB41:
+    MOV A,#9BH
+    CALL    KIRIM
+    RET
+INB5:
+    CALL    ALAMATB
+    JB  ACC.5,INB51
+    MOV A,#9CH
+    CALL    KIRIM
+    RET
+INB51:
+    MOV A,#9DH
+    CALL    KIRIM
+    RET
+INB6:
+    CALL    ALAMATB
+    JB  ACC.6,INB61
+    MOV A,#9EH
+    CALL    KIRIM
+    RET
+INB61:
+    MOV A,#9FH
+    CALL    KIRIM
+    RET
+INB7:
+    CALL    ALAMATB
+    JB  ACC.7,INB71
+    MOV A,#0A0H
+    CALL    KIRIM
+    RET
+INB71:
+    MOV A,#0A1H
+    CALL    KIRIM
+INB8:
+    RET
+;***************************************************************
+;           BACA INPUT C PROG
+;***************************************************************
+INC0:
+    CALL    ALAMATC
+    JB  ACC.0,INC01
+    MOV A,#0A2H
+    CALL    KIRIM
+    RET
+INC01:
+    MOV A,#0A3H
+    CALL    KIRIM
+    RET
+INC1:
+    CALL    ALAMATC
+    JB  ACC.1,INC11
+    MOV A,#0A4H
+    CALL    KIRIM
+    RET
+INC11:
+    MOV A,#0A5H
+    CALL    KIRIM
+    RET
+INC2:
+    CALL    ALAMATC
+    JB  ACC.2,INC21
+    MOV A,#0A6H
+    CALL    KIRIM
+    RET
+INC21:
+    MOV A,#0A7H
+    CALL    KIRIM
+    RET
+INC3:
+    CALL    ALAMATC
+    JB  ACC.3,INC31
+    MOV A,#0A8H
+    CALL    KIRIM
+    RET
+INC31:
+        MOV A,#0A9H
+    CALL    KIRIM
+    RET
+INC4:
+    CALL    ALAMATC
+    JB  ACC.4,INC41
+    MOV A,#0AAH
+    CALL    KIRIM
+    RET
+INC41:
+    MOV A,#0ABH
+    CALL    KIRIM
+    RET
+INC5:
+    CALL    ALAMATC
+    JB  ACC.5,INC51
+    MOV A,#0ACH
+    CALL    KIRIM
+    RET
+INC51:
+    MOV A,#0ADH
+    CALL    KIRIM
+    RET
+INC6:
+    CALL    ALAMATC
+    JB  ACC.6,INC61
+    MOV A,#0AEH
+    CALL    KIRIM
+    RET
+INC61:
+    MOV A,#0AFH
+    CALL    KIRIM
+    RET
+INC7:
+    CALL    ALAMATC
+    JB  ACC.7,INC71
+    MOV A,#0B0H
+    CALL    KIRIM
+    RET
+INC71:
+    MOV A,#0B1H
+    CALL    KIRIM
+INC8:
+    RET
+
+;***************************************************************
+;           BACA DETEKSI PROG
+;***************************************************************
+DET_0:
+    JB  	OBS,DET_01
+    MOV 	A,#0B2H
+    CALL    KIRIM
+    RET 
+	
+DET_01:
+    MOV 	A,#0B3H
+    CALL    KIRIM
+    RET
+	
+DET_1:
+    JB  	LC,DET_11
+    MOV 	A,#0B4H
+    CALL    KIRIM
+    RET 
+	
+DET_11:
+    MOV 	A,#0B5H
+    CALL    KIRIM
+    RET
+	
+DET_2:
+    JB  	LLA,DET_21
+    MOV 	A,#0B6H
+    CALL    KIRIM
+    RET
+	
+DET_21:
+    MOV 	A,#0B7H
+    CALL    KIRIM
+	
+DET_3:
+    RET    
+
+ALMTOUTA:
+    MOV 	DPTR,#800H      
+    MOV 	A,OUTTEMP_A
+    RET
+	
+ALMTOUTB:
+    MOV 	DPTR,#900H      
+    MOV 	A,OUTTEMP_B
+    RET
+	
+ALMTOUTC:
+    MOV 	DPTR,#0A00H     
+    MOV 	A,OUTTEMP_C
+    RET
+	
+;***************************************************************
+;           KIRIM OUTPUT A PROG
+;***************************************************************
+OUTA0:  
+    CALL    ALMTOUTA
+    CLR 	ACC.0
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA01:
+    CALL    ALMTOUTA
+    SETB    ACC.0
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA1:
+    CALL    ALMTOUTA
+    CLR 	ACC.1
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA11:
+    CALL    ALMTOUTA
+    SETB    ACC.1
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA2:
+    CALL    ALMTOUTA
+    CLR 	ACC.2
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA21:
+    CALL    ALMTOUTA
+    SETB    ACC.2
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA3:
+    CALL    ALMTOUTA
+    CLR 	ACC.3
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA31:
+    CALL    ALMTOUTA
+    SETB    ACC.3
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA4:
+    CALL    ALMTOUTA
+    CLR 	ACC.4
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA41:
+    CALL    ALMTOUTA
+    SETB    ACC.4
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA5:
+    CALL    ALMTOUTA
+    CLR 	ACC.5
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA51:
+    CALL    ALMTOUTA
+    SETB    ACC.5
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA6:
+    CALL    ALMTOUTA
+    CLR 	ACC.6
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA61:
+    CALL    ALMTOUTA
+    SETB    ACC.6
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA7:
+    CALL    ALMTOUTA
+    CLR 	ACC.7
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTA71:
+    CALL    ALMTOUTA
+    SETB    ACC.7
+    MOV 	OUTTEMP_A,A
+    MOVX    @DPTR,A
+    RET
+
+;***************************************************************
+;           KIRIM OUTPUT B PROG
+;***************************************************************
+OUTB0:  
+    CALL    ALMTOUTB
+    CLR 	ACC.0
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB01:
+    CALL    ALMTOUTB
+    SETB    ACC.0
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB1:
+    CALL    ALMTOUTB
+    CLR 	ACC.1
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB11:
+    CALL    ALMTOUTB
+    SETB    ACC.1
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB2:
+    CALL    ALMTOUTB
+    CLR 	ACC.2
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB21:
+    CALL    ALMTOUTB
+    SETB    ACC.2
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB3:
+    CALL    ALMTOUTB
+    CLR 	ACC.3
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB31:
+    CALL    ALMTOUTB
+    SETB    ACC.3
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB4:
+    CALL    ALMTOUTB
+    SETB    ACC.4
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    CLR 	BUZZER_FLAG
+    MOV 	TIMER_BUZZER,#1
+    RET
+	
+OUTB41:
+    CALL    ALMTOUTB
+    SETB    ACC.4
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    CLR 	BUZZER_FLAG
+    MOV 	TIMER_BUZZER,#40
+    RET
+	
+OUTB5:
+    CALL    ALMTOUTB
+    CLR 	ACC.5
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB51:
+    CALL    ALMTOUTB
+    SETB    ACC.5
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB6:
+    CALL    ALMTOUTB
+    CLR 	ACC.6
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB61:
+    CALL    ALMTOUTB
+    SETB    ACC.6
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB7:
+    CALL    ALMTOUTB
+    CLR 	ACC.7
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTB71:
+    CALL    ALMTOUTB
+    SETB    ACC.7
+    MOV 	OUTTEMP_B,A
+    MOVX    @DPTR,A
+    RET
+
+;***************************************************************
+;           KIRIM OUTPUT C PROG
+;***************************************************************
+OUTC0:  
+    CALL    ALMTOUTC
+    CLR 	ACC.0
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC01:
+    CALL    ALMTOUTC
+    SETB    ACC.0
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC1:
+    CALL    ALMTOUTC
+    CLR 	ACC.1
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC11:
+    CALL    ALMTOUTC
+    SETB    ACC.1
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC2:
+    CALL    ALMTOUTC
+    CLR 	ACC.2
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC21:
+    CALL    ALMTOUTC
+    SETB    ACC.2
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC3:
+    CALL    ALMTOUTC
+    CLR 	ACC.3
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC31:
+    CALL    ALMTOUTC
+    SETB    ACC.3
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC4:
+    CALL    ALMTOUTC
+    CLR 	ACC.4
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC41:
+    CALL    ALMTOUTC
+    SETB    ACC.4
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC5:
+    CALL    ALMTOUTC
+    CLR 	ACC.5
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC51:
+    CALL    ALMTOUTC
+    SETB    ACC.5
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC6:
+    CALL    ALMTOUTC
+    CLR 	ACC.6
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC61:
+    CALL    ALMTOUTC
+    SETB    ACC.6
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC7:
+    CALL    ALMTOUTC
+    CLR 	ACC.7
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+	
+OUTC71:
+    CALL    ALMTOUTC
+    SETB    ACC.7
+    MOV 	OUTTEMP_C,A
+    MOVX    @DPTR,A
+    RET
+
+;***************************************************************
+;           CHECK OUTPUT A PROG
+;***************************************************************
+COA0:
+    CALL    ALMTOUTA
+    JB  	ACC.0,COA01
+    MOV 	A,#0C2H
+    CALL    KIRIM
+    RET
+	
+COA01:
+    MOV 	A,#0C3H
+    CALL    KIRIM
+    RET
+	
+COA1:
+    CALL    ALMTOUTA
+    JB  	ACC.1,COA11
+    MOV 	A,#0C4H
+    CALL    KIRIM
+    RET
+	
+COA11:
+    MOV 	A,#0C5H
+    CALL    KIRIM
+    RET 
+	
+COA2:
+    CALL    ALMTOUTA
+    JB  	ACC.2,COA21
+    MOV 	A,#0C6H
+    CALL    KIRIM
+    RET
+	
+COA21:
+    MOV 	A,#0C7H
+    CALL    KIRIM
+    RET
+	
+COA3:
+    CALL    ALMTOUTA
+    JB  	ACC.3,COA31
+    MOV 	A,#0C8H
+    CALL    KIRIM
+    RET
+	
+COA31:
+    MOV 	A,#0C9H
+    CALL    KIRIM
+    RET
+	
+COA4:
+    CALL    ALMTOUTA
+    JB  	ACC.4,COA41
+    MOV 	A,#0CAH
+    CALL    KIRIM
+    RET
+	
+COA41:
+    MOV 	A,#0CBH
+    CALL    KIRIM
+    RET
+	
+COA5:
+    CALL    ALMTOUTA
+    JB  	ACC.5,COA51
+    MOV 	A,#0CCH
+    CALL    KIRIM
+    RET
+	
+COA51:
+    MOV 	A,#0CDH
+    CALL    KIRIM
+    RET
+	
+COA6:
+    CALL    ALMTOUTA
+    JB  	ACC.6,COA61
+    MOV 	A,#0CEH
+    CALL    KIRIM
+    RET
+	
+COA61:
+    MOV 	A,#0CFH
+    CALL    KIRIM
+    RET
+	
+COA7:
+    CALL    ALMTOUTA
+    JB  	ACC.7,COA71
+    MOV 	A,#0D0H
+    CALL    KIRIM
+    RET
+	
+COA71:
+    MOV 	A,#0D1H
+    CALL    KIRIM
+    RET
+	
+;***************************************************************
+;           CHECK OUTPUT B PROG
+;***************************************************************
+COB0:
+    CALL    ALMTOUTB
+    JB  	ACC.0,COB01
+    MOV 	A,#0D2H
+    CALL    KIRIM
+    RET
+	
+COB01:
+    MOV 	A,#0D3H
+    CALL    KIRIM
+    RET
+	
+COB1:
+    CALL    ALMTOUTB
+    JB  	ACC.1,COB11
+    MOV 	A,#0D4H
+    CALL    KIRIM
+    RET
+	
+COB11:
+    MOV 	A,#0D5H
+    CALL    KIRIM
+    RET
+	
+COB2:
+    CALL    ALMTOUTB
+    JB  	ACC.2,COB21
+    MOV 	A,#0D6H
+    CALL    KIRIM
+    RET
+	
+COB21:
+    MOV 	A,#0D7H
+    CALL    KIRIM
+    RET
+	
+COB3:
+    CALL    ALMTOUTB
+    JB  	ACC.3,COB31
+    MOV 	A,#0D8H
+    CALL    KIRIM
+    RET
+	
+COB31:
+    MOV 	A,#0D9H
+    CALL    KIRIM
+    RET
+	
+COB4:
+    CALL    ALMTOUTB
+    JB  	ACC.4,COB41
+    MOV 	A,#0DAH
+    CALL    KIRIM
+    RET
+	
+COB41:
+    MOV 	A,#0DBH
+    CALL    KIRIM
+    RET
+	
+COB5:
+    CALL    ALMTOUTB
+    JB  	ACC.5,COB51
+    MOV 	A,#0DCH
+    CALL    KIRIM
+    RET
+	
+COB51:
+    MOV 	A,#0DDH
+    CALL    KIRIM
+    RET
+	
+COB6:
+    CALL    ALMTOUTB
+    JB  	ACC.6,COB61
+    MOV 	A,#0DEH
+    CALL    KIRIM
+    RET
+	
+COB61:
+    MOV 	A,#0DFH
+    CALL    KIRIM
+    RET
+	
+COB7:
+    CALL    ALMTOUTB
+    JB  	ACC.7,COB71
+    MOV 	A,#0E0H
+    CALL    KIRIM
+    RET
+	
+COB71:
+    MOV 	A,#0E1H
+    CALL    KIRIM
+    RET
+	
+;***************************************************************
+;           CHECK OUTPUT C PROG
+;***************************************************************
+COC0:
+    CALL    ALMTOUTC
+    JB  	ACC.0,COC01
+    MOV 	A,#0E2H
+    CALL    KIRIM
+    RET
+	
+COC01:
+    MOV 	A,#0E3H
+    CALL    KIRIM
+    RET
+	
+COC1:
+    CALL    ALMTOUTC
+    JB  	ACC.1,COC11
+    MOV 	A,#0E4H
+    CALL    KIRIM
+    RET
+	
+COC11:
+    MOV 	A,#0E5H
+    CALL    KIRIM
+    RET 
+	
+COC2:
+    CALL    ALMTOUTC
+    JB  	ACC.2,COC21
+    MOV 	A,#0E6H
+    CALL    KIRIM
+    RET
+	
+COC21:
+    MOV 	A,#0E7H
+    CALL    KIRIM
+    RET
+	
+COC3:
+    CALL    ALMTOUTC
+    JB  	ACC.3,COC31
+    MOV 	A,#0E8H
+    CALL    KIRIM
+    RET
+	
+COC31:
+    MOV 	A,#0E9H
+    CALL    KIRIM
+    RET
+	
+COC4:
+    CALL    ALMTOUTC
+    JB  	ACC.4,COC41
+    MOV 	A,#0EAH
+    CALL    KIRIM
+    RET
+	
+COC41:
+    MOV 	A,#0EBH
+    CALL    KIRIM
+    RET
+	
+COC5:
+    CALL    ALMTOUTC
+    JB  	ACC.5,COC51
+    MOV 	A,#0ECH
+    CALL    KIRIM
+    RET
+	
+COC51:
+    MOV 	A,#0EDH
+    CALL    KIRIM
+    RET
+	
+COC6:
+    CALL    ALMTOUTC
+    JB  	ACC.6,COC61
+    MOV 	A,#0EEH
+    CALL    KIRIM
+    RET
+	
+COC61:
+    MOV 	A,#0EFH
+    CALL    KIRIM
+    RET
+	
+COC7:
+    CALL    ALMTOUTC
+    JB  	ACC.7,COC71
+    MOV 	A,#0F0H
+    CALL    KIRIM
+    RET
+	
+COC71:
+    MOV 	A,#0F1H
+    CALL    KIRIM
+    RET
+
+;***************************************************************
+;           MAIN PROG
+;***************************************************************
+MAIN:
+    MOV 	IE,#87H     ;SERIAL 
+    MOV 	IP,#10H
+    MOV 	PCON,#00H   ;RECEIVE ENABLE
+    MOV 	SCON,#50H
+    MOV 	TMOD,#21H   ;TIMER1:8BIT AUTO RELOAD,TIMER2:16BIT TIMER
+    MOV 	TCON,#05FH
+
+    MOV 	TH1,#-3
+    MOV 	TL1,#-3
+    SETB    TR1
+    SETB    REN
+    SETB    ES
+    SETB    TR0
+    SETB    ET0
+
+    SETB    LED_FLAG
+    SETB    BUZZER_FLAG
+    SETB    LC_FLAG
+    SETB    OBS_FLAG
+    SETB    SER_FLAG
+    SETB    LCLNG_FLAG
+    SETB    OBSLNG_FLAG
+    SETB    OBSKIR_FLAG
+    SETB    LCKIR_FLAG
+    SETB    LLAKIR_FLAG
+    SETB    DTR
+    SETB    LLA_FLAG
+    SETB    SWLTS_FLAG
+    SETB    TXFLAG
+    CLR     LC_PIN
+    CLR     OBS_PIN
+    CLR     RTS
+    MOV     LC_POLL,#0
+    MOV     OBS_POLL,#0
+    
+    CLR 	C
+    MOV 	STATUS_RX,#0FFH
+    MOV 	STATUS_DET,#30H 
+        
+    MOV 	A,#10H          ;KIRIM 'STARTUP'
+    CALL    KIRIM
+    
+    MOV 	DATA_8255,#10000000B    ;SET CONTROL WORD
+    MOV 	DPTR,#0B00H     ;INIT OUTPUT 8255 D0-D7 = 80H.A0-A1=1.CS=0.RD=0.WR=1
+    MOV 	A,DATA_8255
+    MOVX    @DPTR,A
+    
+    MOV 	A,#00H          ;INIT OUTPUT A
+    MOV 	OUTTEMP_A,A
+    MOV 	DPTR,#800H      
+    MOVX    @DPTR,A
+    
+    MOV 	A,#00H          ;INIT OUTPUT B
+    MOV 	OUTTEMP_B,A
+    MOV 	DPTR,#900H      
+    MOVX    @DPTR,A
+    
+    MOV 	A,#00H          ;INIT OUTPUT C
+    MOV 	OUTTEMP_C,A
+    MOV 	DPTR,#0A00H     
+    MOVX    @DPTR,A     
+    
+LOOP:
+    CALL    WDT
+    CALL    LC_DET
+    CALL    WDT
+    CALL    OBS_DET
+    JMP LOOP
+END
+
+</code>
+</pre>
+<html>
